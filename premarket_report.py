@@ -213,22 +213,70 @@ def _near_month(rows):
     return min(c, key=lambda x: x[0])[1] if c else None
 
 
-def _pack_night(last, ref, src, idx_close=None, debug=False):
-    """組裝夜盤結果，並做合理性檢查：期貨價應與現貨指數相差不大，否則視為抓錯、不採用。"""
+# 夜盤價與加權前收的最大合理差距。台指期單日漲跌停為 ±10%，抓錯商品（例如價格差一個數量級）才會超過。
+NIGHT_SANITY = 0.12
+
+
+def _pack_night(last, ref, src, idx_close=None, debug=False, why=None):
+    """組裝夜盤結果，並做合理性檢查：期貨價與現貨指數差距過大視為抓錯、不採用。失敗原因寫入 why。"""
     if not last or not ref:
+        if why is not None:
+            why.append(f"{src}:缺成交價或參考價")
         return None
-    if idx_close and abs(last / idx_close - 1) > 0.05:
+    if idx_close and abs(last / idx_close - 1) > NIGHT_SANITY:
+        msg = f"{src}:價格{last:,.0f}偏離加權收盤{idx_close:,.0f}逾{NIGHT_SANITY:.0%}，疑抓錯"
+        if why is not None:
+            why.append(msg)
         if debug:
-            print(f"[檢查] {src} 價格 {last} 與加權收盤 {idx_close:.0f} 差距過大，不採用")
+            print("[檢查]", msg)
         return None
     return dict(last=last, chg=last - ref, pct=(last / ref - 1) * 100, src=src)
 
 
-def taifex_night(today, idx_close=None, debug=False):
+def _parse_night_csv(txt, idx_close=None, debug=False, why=None):
+    """解析期交所「期貨每日交易行情」CSV（Big5 已解碼），取 TX 近月『盤後』列。"""
+    from io import StringIO
+    W = why.append if why is not None else (lambda m: None)
+    if "交易日期" not in txt:
+        W("日行情CSV:無資料表(可能尚未公布)")
+        return None
+    df = pd.read_csv(StringIO(txt), dtype=str, skipinitialspace=True, index_col=False)
+    df.columns = [str(c).strip() for c in df.columns]
+    cm = next((c for c in df.columns if "到期月份" in c), None)
+    if not cm or "契約" not in df.columns or "交易時段" not in df.columns:
+        W(f"日行情CSV:欄位不符{list(df.columns)[:5]}")
+        return None
+    t = df[df["契約"].astype(str).str.strip() == "TX"]
+    t = t[t["交易時段"].astype(str).str.contains("盤後")]
+    if t.empty:
+        W("日行情CSV:尚無今日TX盤後列")
+        return None
+    row = _near_month([(str(m).strip(), rw) for m, (_, rw) in zip(t[cm], t.iterrows())])
+    if row is None:
+        W("日行情CSV:找不到近月合約")
+        return None
+    last, chg = num(row.get("收盤價")), num(row.get("漲跌價"))
+    if debug:
+        print("[D] 近月盤後列:", dict(row))
+    if not last or chg is None:
+        W("日行情CSV:盤後列無收盤價")
+        return None
+    return _pack_night(last, last - chg, "期交所CSV", idx_close, debug, why)
+
+
+def taifex_night(today, idx_close=None, debug=False, why=None):
     """台指期(TX)近月夜盤（盤後交易時段）→ {last, chg, pct, src}。取不到回 None，不拿舊資料充數。
-    期交所規定：盤後時段的『交易日』為歸屬的次一營業日，所以平日早上查今天日期即可。
-    來源順序：C 期交所行情網站(即時) → B 期交所日行情網頁 → A 期交所 OpenAPI（通常晚間才更新）。"""
+    期交所規定：盤後交易屬於「次一個一般交易時段」，所以平日早上查今天日期即可。
+    來源順序：C 行情網站(即時) → D 日行情 CSV 下載 → B 日行情網頁 → A OpenAPI。
+    每個來源失敗的原因都會寫入 why（list），供訊息與 log 顯示。"""
     ymd, roc = today.strftime("%Y%m%d"), f"{today.year - 1911}{today:%m%d}"
+
+    def W(msg):
+        if why is not None:
+            why.append(msg)
+        if debug:
+            print("[原因]", msg)
+
     # 來源 C：期交所行情網站（盤後 MarketType=1）
     try:
         r = requests.post("https://mis.taifex.com.tw/futures/api/getQuoteList", timeout=25,
@@ -240,7 +288,11 @@ def taifex_night(today, idx_close=None, debug=False):
         if debug:
             print("[C] RtCode:", j.get("RtCode"), "筆數:", len(rows), "樣本:", rows[:1])
         cand = [x for x in rows if "/" not in str(x.get("SymbolID", "")) and num(x.get("CLastPrice"))]
-        if cand:
+        if not rows:
+            W(f"行情網站:盤後報價為空(RtCode={j.get('RtCode')})")
+        elif not cand:
+            W(f"行情網站:{len(rows)}筆報價皆無成交價")
+        else:
             row = max(cand, key=lambda x: num(x.get("CTotalVolume")) or 0)   # 成交量最大者視為近月
             last, ref = num(row.get("CLastPrice")), num(row.get("CRefPrice"))
             if not ref and num(row.get("CDiff")) is not None:
@@ -248,12 +300,24 @@ def taifex_night(today, idx_close=None, debug=False):
             if debug:
                 print("[C] 採用:", {k: row.get(k) for k in ("SymbolID", "DispCName", "CLastPrice", "CRefPrice",
                                                           "CDiff", "CDiffRate", "CTotalVolume", "CTime")})
-            out = _pack_night(last, ref, "期交所行情網站", idx_close, debug)
+            out = _pack_night(last, ref, "行情網站", idx_close, debug, why)
             if out:
+                out["src"] = "期交所行情網站"
                 return out
     except Exception as e:
+        W(f"行情網站:{type(e).__name__}")
+    # 來源 D：期交所「期貨每日交易行情」CSV 下載（盤後列歸屬於當日交易日）
+    try:
+        r = requests.post("https://www.taifex.com.tw/cht/3/futDataDown", headers=UA, timeout=30,
+                          data=dict(down_type="1", commodity_id="TX", commodity_id2="",
+                                    queryStartDate=today.strftime("%Y/%m/%d"), queryEndDate=today.strftime("%Y/%m/%d")))
         if debug:
-            print("[C] 失敗:", repr(e))
+            print("[D] HTTP", r.status_code, "bytes", len(r.content))
+        out = _parse_night_csv(r.content.decode("big5", errors="ignore"), idx_close, debug, why)
+        if out:
+            return out
+    except Exception as e:
+        W(f"日行情CSV:{type(e).__name__}")
     # 來源 B：期交所日行情網頁（盤後）
     try:
         r = requests.post("https://www.taifex.com.tw/cht/3/futDailyMarketReport", headers=UA, timeout=25,
@@ -264,6 +328,7 @@ def taifex_night(today, idx_close=None, debug=False):
         tables = pd.read_html(StringIO(r.text))
         if debug:
             print("[B] HTTP", r.status_code, "表格數:", len(tables))
+        hit = False
         for ti, t in enumerate(tables):
             t.columns = [str(c).replace(" ", "") for c in t.columns]
             if debug:
@@ -272,8 +337,8 @@ def taifex_night(today, idx_close=None, debug=False):
             if "最後成交價" in t.columns and "契約" in t.columns:
                 t = t[t["契約"].astype(str).str.strip().str.match(r"^(TX|臺股期貨)$")]
                 if "交易時段" not in t.columns:
-                    if debug:
-                        print("[B] 缺少『交易時段』欄位，無法確認是盤後資料，不採用")
+                    W("日行情網頁:缺少交易時段欄位")
+                    hit = True
                     continue
                 t = t[t["交易時段"].astype(str).str.contains("盤後")]
                 mcol = [c for c in t.columns if "到期月份" in c][0]
@@ -281,22 +346,24 @@ def taifex_night(today, idx_close=None, debug=False):
                 if debug:
                     print("[B] 近月列:", None if row is None else dict(row))
                 if row is not None:
+                    hit = True
                     last, chg = num(row["最後成交價"]), num(row["漲跌價"])
                     if last and chg is not None:
-                        out = _pack_night(last, last - chg, "期交所網頁", idx_close, debug)
+                        out = _pack_night(last, last - chg, "期交所網頁", idx_close, debug, why)
                         if out:
                             return out
+        if not hit:
+            W("日行情網頁:無今日TX盤後列")
     except Exception as e:
-        if debug:
-            print("[B] 失敗:", repr(e))
-    # 來源 A：期交所 OpenAPI（通常當晚才更新，早上多半沒有今日盤後資料）
+        W(f"日行情網頁:{type(e).__name__}")
+    # 來源 A：期交所 OpenAPI
     try:
         r = requests.get("https://openapi.taifex.com.tw/v1/DailyMarketReportFut", headers=UA, timeout=25)
         rows = r.json()
         tx = [x for x in rows if x.get("Contract") == "TX"]
+        dates = sorted({str(x.get("Date")) for x in tx})
         if debug:
-            print("[A] OpenAPI 列數:", len(rows), "TX 列數:", len(tx),
-                  "TX 日期:", sorted({str(x.get("Date")) for x in tx}),
+            print("[A] OpenAPI 列數:", len(rows), "TX 列數:", len(tx), "TX 日期:", dates,
                   "TX 時段:", sorted({str(x.get("TradingSession")) for x in tx}))
         cand = [(str(x.get("ContractMonth(Week)", x.get("ContractMonth", ""))), x) for x in tx
                 if "盤後" in str(x.get("TradingSession", "")) and str(x.get("Date", "")) in (ymd, roc)]
@@ -304,12 +371,13 @@ def taifex_night(today, idx_close=None, debug=False):
         if row:
             last, chg = num(row.get("Last")), num(row.get("Change"))
             if last and chg is not None:
-                out = _pack_night(last, last - chg, "OpenAPI", idx_close, debug)
+                out = _pack_night(last, last - chg, "OpenAPI", idx_close, debug, why)
                 if out:
                     return out
+        else:
+            W(f"OpenAPI:尚無今日盤後列(TX最新日期{dates[-1] if dates else '無'})")
     except Exception as e:
-        if debug:
-            print("[A] 失敗:", repr(e))
+        W(f"OpenAPI:{type(e).__name__}")
     return None
 
 
@@ -693,7 +761,10 @@ def collect_live(today):
                     f1, t1 = row["foreign"], row["trust"]
         data["stock_chips"][code] = (dict(f1=f1, t1=t1, f5=f5, t5=t5, days=days, grade=chips_grade(f5, t5))
                                      if days >= 3 else dict(f1=None, t1=None, f5=None, t5=None, days=days, grade="資料不足"))
-    data["night"] = taifex_night(today, idx_close=float(data["twii"]["Close"].iloc[-1]))
+    why = []
+    data["night"] = taifex_night(today, idx_close=float(data["twii"]["Close"].iloc[-1]), why=why)
+    data["night_why"] = [] if data["night"] else why
+    print("[night]", data["night"] if data["night"] else "取得失敗 → " + "｜".join(why))
     data["fut_oi"] = taifex_fut_oi(last_date)
     return data
 
@@ -772,7 +843,7 @@ def fmt_index(res, us_text, night, data):
     if night:
         L.append(f"**🌙 台指期夜盤** 近月 {night['last']:,.0f} {pct_s(night['pct'])} → 推估加權開盤約 {res['ref']:,.0f}")
     else:
-        L.append("**🌙 台指期夜盤**：資料取得失敗（以昨收作為推估基準）")
+        L.append("**🌙 台指期夜盤**：資料取得失敗（以昨收作為推估基準）" + (("\n　" + "｜".join(data["night_why"])) if data.get("night_why") else ""))
     L.append("")
     L.append(us_text)
     L.append("")
@@ -950,7 +1021,7 @@ def fmt_index_compact(res, night, data):
     if night:
         L.append(f"🌙 夜盤 {night['last']:,.0f} {pct_s(night['pct'])} → 推估開盤約 {res['ref']:,.0f}")
     else:
-        L.append("🌙 夜盤：取得失敗（以昨收為基準）")
+        L.append("🌙 夜盤：取得失敗（以昨收為基準）" + (("\n　" + "｜".join(data["night_why"])) if data.get("night_why") else ""))
     c, oi = res.get("chips"), data.get("fut_oi")
     ch = (f"外資 {c['foreign']:+.0f}億｜投信 {c['trust']:+.0f}億｜自營 {c['dealer']:+.0f}億" if c else "法人資料取得失敗")
     L.append("💰 " + ch + (f"｜外資期貨淨 {oi:+,.0f}口" if oi is not None else ""))
@@ -1044,7 +1115,9 @@ def check_sources():
         ic = float(yf_hist("^TWII").Close.iloc[-1])
     except Exception:
         ic = None
-    print("結果:", taifex_night(today, idx_close=ic, debug=True))
+    why = []
+    print("結果:", taifex_night(today, idx_close=ic, debug=True, why=why))
+    print("失敗原因彙整:", why)
     print("\n== 期交所外資台指期淨未平倉 ==")
     print("結果:", taifex_fut_oi(last, debug=True))
 
