@@ -946,6 +946,33 @@ def _base_score(it):
     return s
 
 
+_EVENT_ENT = ("黃仁勳", "輝達", "聯準會", "鮑爾", "川普", "費半", "台積電ADR", "外資", "投信", "升息", "降息")
+
+
+def _event_tokens(title):
+    """事件指紋：標題中的數字（去千分位）與關鍵人物／機構。同一事件的不同報導通常共用 ≥2 個。"""
+    t = title.replace(",", "")
+    toks = {m for m in re.findall(r"\d+(?:\.\d+)?%?", t) if len(m.rstrip("%")) >= 2}
+    toks |= {e for e in _EVENT_ENT if e in t}
+    return toks
+
+
+def _merge_by_facts(clusters, need=2):
+    """標題文字不像、但講同一件事（共用數字＋人物）的群組合併，避免 Top N 被同一事件洗版。"""
+    for c in clusters:
+        c["tok"] = set().union(*[_event_tokens(m["title"]) for m in c["m"]])
+    merged = []
+    for c in clusters:
+        for g in merged:
+            if len(c["tok"] & g["tok"]) >= need:
+                g["m"] += c["m"]
+                g["tok"] |= c["tok"]
+                break
+        else:
+            merged.append(c)
+    return merged
+
+
 def rank_news(items, min_score=1.0, sim=0.65):
     """相似標題視為同一事件合併（報導家數越多越重要），依重要度排序；完全沒有關鍵字的雜訊剔除。"""
     clusters = []
@@ -958,6 +985,7 @@ def rank_news(items, min_score=1.0, sim=0.65):
                 break
         else:
             clusters.append(dict(nt=nt, m=[it]))
+    clusters = _merge_by_facts(clusters)
     out = []
     for c in clusters:
         rep = max(c["m"], key=_base_score)
