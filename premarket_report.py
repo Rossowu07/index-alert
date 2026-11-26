@@ -1546,9 +1546,23 @@ def check_sources():
             print(s, "OK", df.index[-1].date(), float(df.Close.iloc[-1]))
         except Exception as e:
             print(s, "失敗", repr(e))
+    tgt = None
     for code in WATCHLIST:
         df, sym = tw_hist(code, today)
         print(code, sym, "OK" if df is not None else "失敗", None if df is None else df.index[-1].date())
+        if df is not None:
+            tgt = max(tgt, df.index[-1].date()) if tgt else df.index[-1].date()
+    print("\n== 加權指數補檔（證交所官方資料）==")
+    try:
+        raw = yf_hist("^TWII")
+        pw = []
+        fixed = patch_twii(raw, tgt, pw)
+        print("補檔前最後:", raw.index[-1].date(), float(raw.Close.iloc[-1]),
+              "｜補檔後最後:", fixed.index[-1].date(), float(fixed.Close.iloc[-1]))
+        print("補檔訊息:", pw if pw else "不需補檔")
+        print(fixed.tail(2).to_string())
+    except Exception as e:
+        print("補檔檢查失敗", repr(e))
     last = prev_weekday(today)
     print("\n== 證交所 T86 / BFI82U（最近營業日", last, "）==")
     t = twse_t86(last)
@@ -1556,7 +1570,7 @@ def check_sources():
     print("BFI82U:", twse_inst_total(last))
     print("\n== 期交所夜盤（今日）==")
     try:
-        ic = float(yf_hist("^TWII").Close.iloc[-1])
+        ic = float(patch_twii(yf_hist("^TWII"), tgt).Close.iloc[-1])
     except Exception:
         ic = None
     why = []
