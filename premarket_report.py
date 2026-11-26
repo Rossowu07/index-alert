@@ -144,6 +144,61 @@ def yf_hist(symbol, period="1y"):
     return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
+def twse_taiex_hist(year, month):
+    """證交所『發行量加權股價指數歷史資料』→ DataFrame(Open/High/Low/Close)，取不到回 None。"""
+    for url in ("https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST",
+                "https://www.twse.com.tw/exchangeReport/MI_5MINS_HIST"):
+        j = http_json(url, dict(date=f"{year}{month:02d}01", response="json"))
+        if not j or j.get("stat") != "OK" or not j.get("data"):
+            continue
+        rows = []
+        for r in j["data"]:
+            try:
+                y, m, d = [int(x) for x in str(r[0]).split("/")]
+                o, h, l, c = [num(x) for x in r[1:5]]
+                if None in (o, h, l, c):
+                    continue
+                rows.append((pd.Timestamp(y + 1911, m, d), o, h, l, c))
+            except Exception:
+                continue
+        if rows:
+            return pd.DataFrame(rows, columns=["date", "Open", "High", "Low", "Close"]).set_index("date")
+    return None
+
+
+def patch_twii(df, target, why=None):
+    """Yahoo 的 ^TWII 常比個股晚更新一天。若最後一根 K 棒早於 target（個股最新交易日），
+    以證交所官方指數資料補上缺的日子（成交量補 0，量比自動略過）。補不到就維持原樣並記錄原因。"""
+    try:
+        last = df.index[-1].date()
+        if target is None or last >= target:
+            return df
+        parts = []
+        for ym in sorted({(last.year, last.month), (target.year, target.month)}):
+            h = twse_taiex_hist(*ym)
+            if h is not None:
+                parts.append(h)
+        if not parts:
+            if why is not None:
+                why.append("加權指數補檔失敗:證交所無資料")
+            return df
+        h = pd.concat(parts)
+        h = h[(h.index.date > last) & (h.index.date <= target)]
+        h = h[~h.index.duplicated()].sort_index()
+        if h.empty:
+            if why is not None:
+                why.append(f"加權指數補檔:證交所尚無 {last:%m/%d} 之後資料")
+            return df
+        h["Volume"] = 0.0
+        if why is not None:
+            why.append(f"加權指數已用證交所資料補到 {h.index[-1]:%m/%d}（Yahoo 僅到 {last:%m/%d}）")
+        return pd.concat([df, h[["Open", "High", "Low", "Close", "Volume"]]])
+    except Exception as e:
+        if why is not None:
+            why.append(f"加權指數補檔例外:{type(e).__name__}")
+        return df
+
+
 def tw_hist(code, today):
     """上市(.TW)優先，失敗再試上櫃(.TWO)。"""
     for suf in (".TW", ".TWO"):
@@ -319,13 +374,21 @@ def taifex_night(today, idx_close=None, debug=False, why=None):
             est = False
             # 夜盤收盤後，行情網站會把「參考價」重設成夜盤收盤價 → 漲跌恆為 0（2026-11-27 實測：last=ref=39492、CDiff=0、量 25,936）。
             # 此時改用加權前收當基準估算（期貨與現貨有價差，僅作推估），並在訊息中註明。
-            if idx_close and ref and last == ref and (num(row.get("CDiff")) or 0) == 0 \
+            # 期交所現貨列(TXF-P)的參考價 = 加權前收（官方值），優先於 yfinance 的收盤
+            spot = next((num(x.get("CRefPrice")) for x in rows if str(x.get("SymbolID")) == "TXF-P"), None)
+            base = spot or idx_close
+            mism = bool(spot and idx_close and abs(spot / idx_close - 1) > 0.003)
+            if mism:
+                W(f"yfinance加權收盤{idx_close:,.2f}與期交所現貨前收{spot:,.2f}不一致，疑 Yahoo 資料落後一日")
+            if base and ref and last == ref and (num(row.get("CDiff")) or 0) == 0 \
                     and (num(row.get("CTotalVolume")) or 0) >= 1000:
                 W("行情網站:參考價已被重設(漲跌=0)，改以加權前收估算夜盤漲跌")
-                ref, est = idx_close, True
+                ref, est = base, True
             out = _pack_night(last, ref, "行情網站", idx_close, debug, why)
             if out:
                 out["src"] = "期交所行情網站"
+                if mism:
+                    out["stale_idx"] = True
                 if est:
                     out["est"] = True
                     out["src"] += "(對加權收盤估算)"
@@ -767,6 +830,12 @@ def collect_live(today):
             continue
         data["stocks"][code] = (name, df, sym)
         data["fund"][code] = eval_fund(yf_fundamentals(sym))
+    pwhy = []
+    if data["stocks"]:
+        data["twii"] = patch_twii(data["twii"], max(v[1].index[-1].date() for v in data["stocks"].values()), pwhy)
+    for m in pwhy:
+        print("[twii]", m)
+    data["twii_note"] = pwhy
     dates = [x.date() for x in data["twii"].index[-5:]]
     last_date = dates[-1]
     data["idx_chips"] = twse_inst_total(last_date)
@@ -1422,6 +1491,9 @@ def build_messages(data, detail=False):
     today = data["today"]
     banner = "【DEMO 合成資料，非真實行情】\n" if data.get("demo") else ""
     head = f"{banner}📊 **盤前報告｜{today:%Y-%m-%d}（{WD[today.weekday()]}）**"
+    _tn = [m for m in (data.get("twii_note") or []) if ("失敗" in m or "尚無" in m or "例外" in m)]
+    if _tn:
+        head += "\n⚠️ 加權指數資料可能落後一個交易日：" + "；".join(_tn)
     idx_res, us_text, night = index_section(data)
     _, _, us_avg = us_section(data)
     stock_res, stock_txt = {}, []
